@@ -30,7 +30,7 @@ jest.mock('~/models', () => ({
   updateFileUsage: jest.fn(),
 }));
 
-jest.mock('langchain/chat_models/openai', () => {
+jest.mock('@langchain/openai', () => {
   return {
     ChatOpenAI: jest.fn().mockImplementation(() => {
       return {};
@@ -61,7 +61,7 @@ describe('BaseClient', () => {
   const options = {
     // debug: true,
     modelOptions: {
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini',
       temperature: 0,
     },
   };
@@ -615,9 +615,9 @@ describe('BaseClient', () => {
     test('getTokenCount for response is called with the correct arguments', async () => {
       const tokenCountMap = {}; // Mock tokenCountMap
       TestClient.buildMessages.mockReturnValue({ prompt: [], tokenCountMap });
-      TestClient.getTokenCount = jest.fn();
+      TestClient.getTokenCountForResponse = jest.fn();
       const response = await TestClient.sendMessage('Hello, world!', {});
-      expect(TestClient.getTokenCount).toHaveBeenCalledWith(response.text);
+      expect(TestClient.getTokenCountForResponse).toHaveBeenCalledWith(response);
     });
 
     test('returns an object with the correct shape', async () => {

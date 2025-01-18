@@ -4,6 +4,7 @@ const {
   supportsBalanceCheck,
   isAgentsEndpoint,
   isParamEndpoint,
+  EModelEndpoint,
   ErrorTypes,
   Constants,
   CacheKeys,
@@ -11,6 +12,7 @@ const {
 } = require('librechat-data-provider');
 const { getMessages, saveMessage, updateMessage, saveConvo } = require('~/models');
 const { addSpaceIfNeeded, isEnabled } = require('~/server/utils');
+const { truncateToolCallOutputs } = require('./prompts');
 const checkBalance = require('~/models/checkBalance');
 const { getFiles } = require('~/models/File');
 const { getLogStores } = require('~/cache');
@@ -50,6 +52,8 @@ class BaseClient {
     /** The key for the usage object's output tokens
      * @type {string} */
     this.outputTokensKey = 'completion_tokens';
+    /** @type {Set<string>} */
+    this.savedMessageIds = new Set();
   }
 
   setOptions() {
@@ -84,7 +88,7 @@ class BaseClient {
       return this.options.agent.id;
     }
 
-    return this.modelOptions.model;
+    return this.modelOptions?.model ?? this.model;
   }
 
   /**
@@ -93,7 +97,7 @@ class BaseClient {
    * @returns {number}
    */
   getTokenCountForResponse(responseMessage) {
-    logger.debug('`[BaseClient] recordTokenUsage` not implemented.', responseMessage);
+    logger.debug('[BaseClient] `recordTokenUsage` not implemented.', responseMessage);
   }
 
   /**
@@ -104,7 +108,7 @@ class BaseClient {
    * @returns {Promise<void>}
    */
   async recordTokenUsage({ promptTokens, completionTokens }) {
-    logger.debug('`[BaseClient] recordTokenUsage` not implemented.', {
+    logger.debug('[BaseClient] `recordTokenUsage` not implemented.', {
       promptTokens,
       completionTokens,
     });
@@ -285,6 +289,9 @@ class BaseClient {
   }
 
   async handleTokenCountMap(tokenCountMap) {
+    if (this.clientName === EModelEndpoint.agents) {
+      return;
+    }
     if (this.currentMessages.length === 0) {
       return;
     }
@@ -392,6 +399,21 @@ class BaseClient {
     _instructions && logger.debug('[BaseClient] instructions tokenCount: ' + tokenCount);
     let payload = this.addInstructions(formattedMessages, _instructions);
     let orderedWithInstructions = this.addInstructions(orderedMessages, instructions);
+    if (this.clientName === EModelEndpoint.agents) {
+      const { dbMessages, editedIndices } = truncateToolCallOutputs(
+        orderedWithInstructions,
+        this.maxContextTokens,
+        this.getTokenCountForMessage.bind(this),
+      );
+
+      if (editedIndices.length > 0) {
+        logger.debug('[BaseClient] Truncated tool call outputs:', editedIndices);
+        for (const index of editedIndices) {
+          payload[index].content = dbMessages[index].content;
+        }
+        orderedWithInstructions = dbMessages;
+      }
+    }
 
     let { context, remainingContextTokens, messagesToRefine, summaryIndex } =
       await this.getMessagesWithinTokenLimit(orderedWithInstructions);
@@ -508,7 +530,7 @@ class BaseClient {
           conversationId,
           parentMessageId: userMessage.messageId,
           isCreatedByUser: false,
-          model: this.modelOptions.model,
+          model: this.modelOptions?.model ?? this.model,
           sender: this.sender,
           text: generation,
         };
@@ -545,6 +567,7 @@ class BaseClient {
 
     if (!isEdited && !this.skipSaveUserMessage) {
       this.userMessagePromise = this.saveMessageToDatabase(userMessage, saveOptions, user);
+      this.savedMessageIds.add(userMessage.messageId);
       if (typeof opts?.getReqData === 'function') {
         opts.getReqData({
           userMessagePromise: this.userMessagePromise,
@@ -563,8 +586,8 @@ class BaseClient {
           user: this.user,
           tokenType: 'prompt',
           amount: promptTokens,
-          model: this.modelOptions.model,
           endpoint: this.options.endpoint,
+          model: this.modelOptions?.model ?? this.model,
           endpointTokenConfig: this.options.endpointTokenConfig,
         },
       });
@@ -574,6 +597,7 @@ class BaseClient {
     const completion = await this.sendCompletion(payload, opts);
     this.abortController.requestCompleted = true;
 
+    /** @type {TMessage} */
     const responseMessage = {
       messageId: responseMessageId,
       conversationId,
@@ -621,7 +645,7 @@ class BaseClient {
         await this.updateUserMessageTokenCount({ usage, tokenCountMap, userMessage, opts });
       } else {
         responseMessage.tokenCount = this.getTokenCountForResponse(responseMessage);
-        completionTokens = this.getTokenCount(completion);
+        completionTokens = responseMessage.tokenCount;
       }
 
       await this.recordTokenUsage({ promptTokens, completionTokens, usage });
@@ -635,16 +659,27 @@ class BaseClient {
       responseMessage.attachments = (await Promise.all(this.artifactPromises)).filter((a) => a);
     }
 
+    if (this.options.attachments) {
+      try {
+        saveOptions.files = this.options.attachments.map((attachments) => attachments.file_id);
+      } catch (error) {
+        logger.error('[BaseClient] Error mapping attachments for conversation', error);
+      }
+    }
+
     this.responsePromise = this.saveMessageToDatabase(responseMessage, saveOptions, user);
-    const messageCache = getLogStores(CacheKeys.MESSAGES);
-    messageCache.set(
-      responseMessageId,
-      {
-        text: responseMessage.text,
-        complete: true,
-      },
-      Time.FIVE_MINUTES,
-    );
+    this.savedMessageIds.add(responseMessage.messageId);
+    if (responseMessage.text) {
+      const messageCache = getLogStores(CacheKeys.MESSAGES);
+      messageCache.set(
+        responseMessageId,
+        {
+          text: responseMessage.text,
+          complete: true,
+        },
+        Time.FIVE_MINUTES,
+      );
+    }
     delete responseMessage.tokenCount;
     return responseMessage;
   }
@@ -902,8 +937,9 @@ class BaseClient {
     // Note: gpt-3.5-turbo and gpt-4 may update over time. Use default for these as well as for unknown models
     let tokensPerMessage = 3;
     let tokensPerName = 1;
+    const model = this.modelOptions?.model ?? this.model;
 
-    if (this.modelOptions.model === 'gpt-3.5-turbo-0301') {
+    if (model === 'gpt-3.5-turbo-0301') {
       tokensPerMessage = 4;
       tokensPerName = -1;
     }
@@ -912,6 +948,24 @@ class BaseClient {
       if (Array.isArray(value)) {
         for (let item of value) {
           if (!item || !item.type || item.type === 'image_url') {
+            continue;
+          }
+
+          if (item.type === 'tool_call' && item.tool_call != null) {
+            const toolName = item.tool_call?.name || '';
+            if (toolName != null && toolName && typeof toolName === 'string') {
+              numTokens += this.getTokenCount(toolName);
+            }
+
+            const args = item.tool_call?.args || '';
+            if (args != null && args && typeof args === 'string') {
+              numTokens += this.getTokenCount(args);
+            }
+
+            const output = item.tool_call?.output || '';
+            if (output != null && output && typeof output === 'string') {
+              numTokens += this.getTokenCount(output);
+            }
             continue;
           }
 
@@ -961,6 +1015,15 @@ class BaseClient {
       return _messages;
     }
 
+    const seen = new Set();
+    const attachmentsProcessed =
+      this.options.attachments && !(this.options.attachments instanceof Promise);
+    if (attachmentsProcessed) {
+      for (const attachment of this.options.attachments) {
+        seen.add(attachment.file_id);
+      }
+    }
+
     /**
      *
      * @param {TMessage} message
@@ -971,7 +1034,19 @@ class BaseClient {
         this.message_file_map = {};
       }
 
-      const fileIds = message.files.map((file) => file.file_id);
+      const fileIds = [];
+      for (const file of message.files) {
+        if (seen.has(file.file_id)) {
+          continue;
+        }
+        fileIds.push(file.file_id);
+        seen.add(file.file_id);
+      }
+
+      if (fileIds.length === 0) {
+        return message;
+      }
+
       const files = await getFiles({
         file_id: { $in: fileIds },
       });
