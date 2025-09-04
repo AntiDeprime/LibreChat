@@ -1,16 +1,30 @@
-# v0.7.6
+# v0.8.0-rc3
 
 # Base node image
 FROM node:20-alpine AS node
 
-RUN apk --no-cache add curl
+# Install jemalloc
+RUN apk add --no-cache jemalloc
+RUN apk add --no-cache python3 py3-pip uv
+
+# Set environment variable to use jemalloc
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+
+# Add `uv` for extended MCP support
+COPY --from=ghcr.io/astral-sh/uv:0.6.13 /uv /uvx /bin/
+RUN uv --version
 
 RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
 
 USER node
 
-COPY --chown=node:node . .
+COPY --chown=node:node package.json package-lock.json ./
+COPY --chown=node:node api/package.json ./api/package.json
+COPY --chown=node:node client/package.json ./client/package.json
+COPY --chown=node:node packages/data-provider/package.json ./packages/data-provider/package.json
+COPY --chown=node:node packages/data-schemas/package.json ./packages/data-schemas/package.json
+COPY --chown=node:node packages/api/package.json ./packages/api/package.json
 
 RUN \
     # Allow mounting of these files, which have no default
@@ -20,7 +34,11 @@ RUN \
     npm config set fetch-retry-maxtimeout 600000 ; \
     npm config set fetch-retries 5 ; \
     npm config set fetch-retry-mintimeout 15000 ; \
-    npm install --no-audit; \
+    npm ci --no-audit
+
+COPY --chown=node:node . .
+
+RUN \
     # React client build
     NODE_OPTIONS="--max-old-space-size=2048" npm run frontend; \
     npm prune --production; \

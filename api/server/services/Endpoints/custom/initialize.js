@@ -1,3 +1,11 @@
+const { Providers } = require('@librechat/agents');
+const {
+  resolveHeaders,
+  isUserProvided,
+  getOpenAIConfig,
+  getCustomEndpointConfig,
+  createHandleLLMNewToken,
+} = require('@librechat/api');
 const {
   CacheKeys,
   ErrorTypes,
@@ -5,22 +13,22 @@ const {
   FetchTokenConfig,
   extractEnvVariable,
 } = require('librechat-data-provider');
-const { Providers } = require('@librechat/agents');
 const { getUserKeyValues, checkUserKeyExpiry } = require('~/server/services/UserService');
-const { getLLMConfig } = require('~/server/services/Endpoints/openAI/llm');
-const { getCustomEndpointConfig } = require('~/server/services/Config');
 const { fetchModels } = require('~/server/services/ModelService');
-const { isUserProvided, sleep } = require('~/server/utils');
+const OpenAIClient = require('~/app/clients/OpenAIClient');
 const getLogStores = require('~/cache/getLogStores');
-const { OpenAIClient } = require('~/app');
 
 const { PROXY } = process.env;
 
 const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrideEndpoint }) => {
+  const appConfig = req.config;
   const { key: expiresAt } = req.body;
   const endpoint = overrideEndpoint ?? req.body.endpoint;
 
-  const endpointConfig = await getCustomEndpointConfig(endpoint);
+  const endpointConfig = getCustomEndpointConfig({
+    endpoint,
+    appConfig,
+  });
   if (!endpointConfig) {
     throw new Error(`Config not found for the ${endpoint} custom endpoint.`);
   }
@@ -28,12 +36,13 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
   const CUSTOM_API_KEY = extractEnvVariable(endpointConfig.apiKey);
   const CUSTOM_BASE_URL = extractEnvVariable(endpointConfig.baseURL);
 
-  let resolvedHeaders = {};
-  if (endpointConfig.headers && typeof endpointConfig.headers === 'object') {
-    Object.keys(endpointConfig.headers).forEach((key) => {
-      resolvedHeaders[key] = extractEnvVariable(endpointConfig.headers[key]);
-    });
-  }
+  /** Intentionally excludes passing `body`, i.e. `req.body`, as
+   *  values may not be accurate until `AgentClient` is initialized
+   */
+  let resolvedHeaders = resolveHeaders({
+    headers: endpointConfig.headers,
+    user: req.user,
+  });
 
   if (CUSTOM_API_KEY.match(envVarRegex)) {
     throw new Error(`Missing API Key for ${endpoint}.`);
@@ -104,6 +113,7 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
     headers: resolvedHeaders,
     addParams: endpointConfig.addParams,
     dropParams: endpointConfig.dropParams,
+    customParams: endpointConfig.customParams,
     titleConvo: endpointConfig.titleConvo,
     titleModel: endpointConfig.titleModel,
     forcePrompt: endpointConfig.forcePrompt,
@@ -117,8 +127,7 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
     endpointTokenConfig,
   };
 
-  /** @type {undefined | TBaseEndpoint} */
-  const allConfig = req.app.locals.all;
+  const allConfig = appConfig.endpoints?.all;
   if (allConfig) {
     customOptions.streamRate = allConfig.streamRate;
   }
@@ -133,7 +142,7 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
   };
 
   if (optionsOnly) {
-    const modelOptions = endpointOption.model_parameters;
+    const modelOptions = endpointOption?.model_parameters ?? {};
     if (endpoint !== Providers.OLLAMA) {
       clientOptions = Object.assign(
         {
@@ -141,15 +150,18 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
         },
         clientOptions,
       );
-      const options = getLLMConfig(apiKey, clientOptions);
-      if (!customOptions.streamRate) {
+      clientOptions.modelOptions.user = req.user.id;
+      const options = getOpenAIConfig(apiKey, clientOptions, endpoint);
+      if (options != null) {
+        options.useLegacyContent = true;
+        options.endpointTokenConfig = endpointTokenConfig;
+      }
+      if (!clientOptions.streamRate) {
         return options;
       }
       options.llmConfig.callbacks = [
         {
-          handleLLMNewToken: async () => {
-            await sleep(customOptions.streamRate);
-          },
+          handleLLMNewToken: createHandleLLMNewToken(clientOptions.streamRate),
         },
       ];
       return options;
@@ -161,6 +173,7 @@ const initializeClient = async ({ req, res, endpointOption, optionsOnly, overrid
     }
 
     return {
+      useLegacyContent: true,
       llmConfig: modelOptions,
     };
   }

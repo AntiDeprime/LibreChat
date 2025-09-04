@@ -1,22 +1,29 @@
+const { MCPManager, FlowStateManager } = require('@librechat/api');
 const { EventSource } = require('eventsource');
+const { Time } = require('librechat-data-provider');
 const logger = require('./winston');
 
 global.EventSource = EventSource;
 
-let mcpManager = null;
+/** @type {MCPManager} */
+let flowManager = null;
 
 /**
- * @returns {Promise<MCPManager>}
+ * @param {Keyv} flowsCache
+ * @returns {FlowStateManager}
  */
-async function getMCPManager() {
-  if (!mcpManager) {
-    const { MCPManager } = await import('librechat-mcp');
-    mcpManager = MCPManager.getInstance(logger);
+function getFlowStateManager(flowsCache) {
+  if (!flowManager) {
+    flowManager = new FlowStateManager(flowsCache, {
+      ttl: Time.ONE_MINUTE * 3,
+    });
   }
-  return mcpManager;
+  return flowManager;
 }
 
 module.exports = {
   logger,
-  getMCPManager,
+  createMCPManager: MCPManager.createInstance,
+  getMCPManager: MCPManager.getInstance,
+  getFlowStateManager,
 };

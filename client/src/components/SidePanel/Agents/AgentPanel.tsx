@@ -1,57 +1,89 @@
-import React, { useMemo, useCallback } from 'react';
+import { Plus } from 'lucide-react';
+import React, { useMemo, useCallback, useRef } from 'react';
+import { Button, useToastContext } from '@librechat/client';
+import { useWatch, useForm, FormProvider } from 'react-hook-form';
 import { useGetModelsQuery } from 'librechat-data-provider/react-query';
-import { Controller, useWatch, useForm, FormProvider } from 'react-hook-form';
 import {
   Tools,
+  Constants,
   SystemRoles,
+  ResourceType,
   EModelEndpoint,
+  PermissionBits,
   isAssistantsEndpoint,
-  defaultAgentFormValues,
 } from 'librechat-data-provider';
-import type { AgentForm, AgentPanelProps, StringOption } from '~/common';
+import type { AgentForm, StringOption } from '~/common';
 import {
   useCreateAgentMutation,
   useUpdateAgentMutation,
   useGetAgentByIdQuery,
+  useGetExpandedAgentByIdQuery,
 } from '~/data-provider';
+import { createProviderOption, getDefaultAgentFormValues } from '~/utils';
+import { useResourcePermissions } from '~/hooks/useResourcePermissions';
 import { useSelectAgent, useLocalize, useAuthContext } from '~/hooks';
+import { useAgentPanelContext } from '~/Providers/AgentPanelContext';
 import AgentPanelSkeleton from './AgentPanelSkeleton';
-import { createProviderOption } from '~/utils';
-import { useToastContext } from '~/Providers';
+import AdvancedPanel from './Advanced/AdvancedPanel';
 import AgentConfig from './AgentConfig';
 import AgentSelect from './AgentSelect';
-import { Button } from '~/components';
+import AgentFooter from './AgentFooter';
 import ModelPanel from './ModelPanel';
 import { Panel } from '~/common';
 
-export default function AgentPanel({
-  setAction,
-  activePanel,
-  actions = [],
-  setActivePanel,
-  agent_id: current_agent_id,
-  setCurrentAgentId,
-  agentsConfig,
-  endpointsConfig,
-}: AgentPanelProps) {
+export default function AgentPanel() {
   const localize = useLocalize();
   const { user } = useAuthContext();
   const { showToast } = useToastContext();
+  const {
+    activePanel,
+    agentsConfig,
+    setActivePanel,
+    endpointsConfig,
+    setCurrentAgentId,
+    agent_id: current_agent_id,
+  } = useAgentPanelContext();
 
   const { onSelect: onSelectAgent } = useSelectAgent();
 
   const modelsQuery = useGetModelsQuery();
-  const agentQuery = useGetAgentByIdQuery(current_agent_id ?? '', {
-    enabled: !!(current_agent_id ?? ''),
+
+  // Basic agent query for initial permission check
+  const basicAgentQuery = useGetAgentByIdQuery(current_agent_id ?? '', {
+    enabled: !!(current_agent_id ?? '') && current_agent_id !== Constants.EPHEMERAL_AGENT_ID,
   });
+
+  const { hasPermission, isLoading: permissionsLoading } = useResourcePermissions(
+    ResourceType.AGENT,
+    basicAgentQuery.data?._id || '',
+  );
+
+  const canEdit = hasPermission(PermissionBits.EDIT);
+
+  const expandedAgentQuery = useGetExpandedAgentByIdQuery(current_agent_id ?? '', {
+    enabled:
+      !!(current_agent_id ?? '') &&
+      current_agent_id !== Constants.EPHEMERAL_AGENT_ID &&
+      canEdit &&
+      !permissionsLoading,
+  });
+
+  const agentQuery = canEdit && expandedAgentQuery.data ? expandedAgentQuery : basicAgentQuery;
 
   const models = useMemo(() => modelsQuery.data ?? {}, [modelsQuery.data]);
   const methods = useForm<AgentForm>({
-    defaultValues: defaultAgentFormValues,
+    defaultValues: getDefaultAgentFormValues(),
+    mode: 'onChange',
   });
 
   const { control, handleSubmit, reset } = methods;
   const agent_id = useWatch({ control, name: 'id' });
+  const previousVersionRef = useRef<number | undefined>();
+
+  const allowedProviders = useMemo(
+    () => new Set(agentsConfig?.allowedProviders),
+    [agentsConfig?.allowedProviders],
+  );
 
   const providers = useMemo(
     () =>
@@ -59,23 +91,37 @@ export default function AgentPanel({
         .filter(
           (key) =>
             !isAssistantsEndpoint(key) &&
+            (allowedProviders.size > 0 ? allowedProviders.has(key) : true) &&
             key !== EModelEndpoint.agents &&
             key !== EModelEndpoint.chatGPTBrowser &&
-            key !== EModelEndpoint.gptPlugins &&
-            key !== EModelEndpoint.bingAI,
+            key !== EModelEndpoint.gptPlugins,
         )
         .map((provider) => createProviderOption(provider)),
-    [endpointsConfig],
+    [endpointsConfig, allowedProviders],
   );
 
   /* Mutations */
   const update = useUpdateAgentMutation({
+    onMutate: () => {
+      // Store the current version before mutation
+      previousVersionRef.current = agentQuery.data?.version;
+    },
     onSuccess: (data) => {
-      showToast({
-        message: `${localize('com_assistants_update_success')} ${
-          data.name ?? localize('com_ui_agent')
-        }`,
-      });
+      // Check if agent version is the same (no changes were made)
+      if (previousVersionRef.current !== undefined && data.version === previousVersionRef.current) {
+        showToast({
+          message: localize('com_ui_no_changes'),
+          status: 'info',
+        });
+      } else {
+        showToast({
+          message: `${localize('com_assistants_update_success')} ${
+            data.name ?? localize('com_ui_agent')
+          }`,
+        });
+      }
+      // Clear the ref after use
+      previousVersionRef.current = undefined;
     },
     onError: (err) => {
       const error = err as Error;
@@ -118,9 +164,13 @@ export default function AgentPanel({
       if (data.file_search === true) {
         tools.push(Tools.file_search);
       }
+      if (data.web_search === true) {
+        tools.push(Tools.web_search);
+      }
 
       const {
         name,
+        artifacts,
         description,
         instructions,
         model: _model,
@@ -129,6 +179,9 @@ export default function AgentPanel({
         agent_ids,
         end_after_tools,
         hide_sequential_outputs,
+        recursion_limit,
+        category,
+        support_contact,
       } = data;
 
       const model = _model ?? '';
@@ -140,6 +193,7 @@ export default function AgentPanel({
           agent_id,
           data: {
             name,
+            artifacts,
             description,
             instructions,
             model,
@@ -149,6 +203,9 @@ export default function AgentPanel({
             agent_ids,
             end_after_tools,
             hide_sequential_outputs,
+            recursion_limit,
+            category,
+            support_contact,
           },
         });
         return;
@@ -160,9 +217,16 @@ export default function AgentPanel({
           status: 'error',
         });
       }
+      if (!name) {
+        return showToast({
+          message: localize('com_agents_missing_name'),
+          status: 'error',
+        });
+      }
 
       create.mutate({
         name,
+        artifacts,
         description,
         instructions,
         model,
@@ -172,6 +236,9 @@ export default function AgentPanel({
         agent_ids,
         end_after_tools,
         hide_sequential_outputs,
+        recursion_limit,
+        category,
+        support_contact,
       });
     },
     [agent_id, create, update, showToast, localize],
@@ -184,23 +251,16 @@ export default function AgentPanel({
   }, [agent_id, onSelectAgent]);
 
   const canEditAgent = useMemo(() => {
-    const canEdit =
-      agentQuery.data?.isCollaborative ?? false
-        ? true
-        : agentQuery.data?.author === user?.id || user?.role === SystemRoles.ADMIN;
+    if (!agentQuery.data?.id) {
+      return true;
+    }
 
-    return agentQuery.data?.id != null && agentQuery.data.id ? canEdit : true;
-  }, [
-    agentQuery.data?.isCollaborative,
-    agentQuery.data?.author,
-    agentQuery.data?.id,
-    user?.id,
-    user?.role,
-  ]);
+    if (user?.role === SystemRoles.ADMIN) {
+      return true;
+    }
 
-  if (agentQuery.isInitialLoading) {
-    return <AgentPanelSkeleton />;
-  }
+    return canEdit;
+  }, [agentQuery.data?.id, user?.role, canEdit]);
 
   return (
     <FormProvider {...methods}>
@@ -209,37 +269,53 @@ export default function AgentPanel({
         className="scrollbar-gutter-stable h-auto w-full flex-shrink-0 overflow-x-hidden"
         aria-label="Agent configuration form"
       >
-        <div className="mt-2 flex w-full flex-wrap gap-2">
-          <Controller
-            name="agent"
-            control={control}
-            render={({ field }) => (
-              <AgentSelect
-                reset={reset}
-                value={field.value}
-                agentQuery={agentQuery}
-                setCurrentAgentId={setCurrentAgentId}
-                selectedAgentId={current_agent_id ?? null}
-                createMutation={create}
-              />
-            )}
-          />
-          {/* Select Button */}
+        <div className="mx-1 mt-2 flex w-full flex-wrap gap-2">
+          <div className="w-full">
+            <AgentSelect
+              createMutation={create}
+              agentQuery={agentQuery}
+              setCurrentAgentId={setCurrentAgentId}
+              // The following is required to force re-render the component when the form's agent ID changes
+              // Also maintains ComboBox Focus for Accessibility
+              selectedAgentId={agentQuery.isInitialLoading ? null : (current_agent_id ?? null)}
+            />
+          </div>
+          {/* Create + Select Button */}
           {agent_id && (
-            <Button
-              variant="submit"
-              disabled={!agent_id}
-              onClick={(e) => {
-                e.preventDefault();
-                handleSelectAgent();
-              }}
-              aria-label="Select agent"
-            >
-              {localize('com_ui_select')}
-            </Button>
+            <div className="flex w-full gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full justify-center"
+                onClick={() => {
+                  reset(getDefaultAgentFormValues());
+                  setCurrentAgentId(undefined);
+                }}
+                disabled={agentQuery.isInitialLoading}
+              >
+                <Plus className="mr-1 h-4 w-4" />
+                {localize('com_ui_create') +
+                  ' ' +
+                  localize('com_ui_new') +
+                  ' ' +
+                  localize('com_ui_agent')}
+              </Button>
+              <Button
+                variant="submit"
+                disabled={!agent_id || agentQuery.isInitialLoading}
+                onClick={(e) => {
+                  e.preventDefault();
+                  handleSelectAgent();
+                }}
+                aria-label={localize('com_ui_select') + ' ' + localize('com_ui_agent')}
+              >
+                {localize('com_ui_select')}
+              </Button>
+            </div>
           )}
         </div>
-        {!canEditAgent && (
+        {agentQuery.isInitialLoading && <AgentPanelSkeleton />}
+        {!canEditAgent && !agentQuery.isInitialLoading && (
           <div className="flex h-[30vh] w-full items-center justify-center">
             <div className="text-center">
               <h2 className="text-token-text-primary m-2 text-xl font-semibold">
@@ -249,21 +325,21 @@ export default function AgentPanel({
             </div>
           </div>
         )}
-        {canEditAgent && activePanel === Panel.model && (
-          <ModelPanel
-            setActivePanel={setActivePanel}
-            agent_id={agent_id}
-            providers={providers}
-            models={models}
-          />
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.model && (
+          <ModelPanel models={models} providers={providers} setActivePanel={setActivePanel} />
         )}
-        {canEditAgent && activePanel === Panel.builder && (
-          <AgentConfig
-            actions={actions}
-            setAction={setAction}
-            agentsConfig={agentsConfig}
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.builder && (
+          <AgentConfig createMutation={create} />
+        )}
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.advanced && (
+          <AdvancedPanel />
+        )}
+        {canEditAgent && !agentQuery.isInitialLoading && (
+          <AgentFooter
+            createMutation={create}
+            updateMutation={update}
+            activePanel={activePanel}
             setActivePanel={setActivePanel}
-            endpointsConfig={endpointsConfig}
             setCurrentAgentId={setCurrentAgentId}
           />
         )}

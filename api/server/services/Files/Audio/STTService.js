@@ -2,22 +2,89 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const FormData = require('form-data');
 const { Readable } = require('stream');
+const { logger } = require('@librechat/data-schemas');
+const { genAzureEndpoint } = require('@librechat/api');
 const { extractEnvVariable, STTProviders } = require('librechat-data-provider');
-const { getCustomConfig } = require('~/server/services/Config');
-const { genAzureEndpoint } = require('~/utils');
-const { logger } = require('~/config');
+const { getAppConfig } = require('~/server/services/Config');
+
+/**
+ * Maps MIME types to their corresponding file extensions for audio files.
+ * @type {Object}
+ */
+const MIME_TO_EXTENSION_MAP = {
+  // MP4 container formats
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  // Ogg formats
+  'audio/ogg': 'ogg',
+  'audio/vorbis': 'ogg',
+  'application/ogg': 'ogg',
+  // Wave formats
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/wave': 'wav',
+  // MP3 formats
+  'audio/mp3': 'mp3',
+  'audio/mpeg': 'mp3',
+  'audio/mpeg3': 'mp3',
+  // WebM formats
+  'audio/webm': 'webm',
+  // Additional formats
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+};
+
+/**
+ * Gets the file extension from the MIME type.
+ * @param {string} mimeType - The MIME type.
+ * @returns {string} The file extension.
+ */
+function getFileExtensionFromMime(mimeType) {
+  // Default fallback
+  if (!mimeType) {
+    return 'webm';
+  }
+
+  // Direct lookup (fastest)
+  const extension = MIME_TO_EXTENSION_MAP[mimeType];
+  if (extension) {
+    return extension;
+  }
+
+  // Try to extract subtype as fallback
+  const subtype = mimeType.split('/')[1]?.toLowerCase();
+
+  // If subtype matches a known extension
+  if (['mp3', 'mp4', 'ogg', 'wav', 'webm', 'm4a', 'flac'].includes(subtype)) {
+    return subtype === 'mp4' ? 'm4a' : subtype;
+  }
+
+  // Generic checks for partial matches
+  if (subtype?.includes('mp4') || subtype?.includes('m4a')) {
+    return 'm4a';
+  }
+  if (subtype?.includes('ogg')) {
+    return 'ogg';
+  }
+  if (subtype?.includes('wav')) {
+    return 'wav';
+  }
+  if (subtype?.includes('mp3') || subtype?.includes('mpeg')) {
+    return 'mp3';
+  }
+  if (subtype?.includes('webm')) {
+    return 'webm';
+  }
+
+  return 'webm'; // Default fallback
+}
 
 /**
  * Service class for handling Speech-to-Text (STT) operations.
  * @class
  */
 class STTService {
-  /**
-   * Creates an instance of STTService.
-   * @param {Object} customConfig - The custom configuration object.
-   */
-  constructor(customConfig) {
-    this.customConfig = customConfig;
+  constructor() {
     this.providerStrategies = {
       [STTProviders.OPENAI]: this.openAIProvider,
       [STTProviders.AZURE_OPENAI]: this.azureOpenAIProvider,
@@ -32,21 +99,22 @@ class STTService {
    * @throws {Error} If the custom config is not found.
    */
   static async getInstance() {
-    const customConfig = await getCustomConfig();
-    if (!customConfig) {
-      throw new Error('Custom config not found');
-    }
-    return new STTService(customConfig);
+    return new STTService();
   }
 
   /**
    * Retrieves the configured STT provider and its schema.
+   * @param {ServerRequest} req - The request object.
    * @returns {Promise<[string, Object]>} A promise that resolves to an array containing the provider name and its schema.
    * @throws {Error} If no STT schema is set, multiple providers are set, or no provider is set.
    */
-  async getProviderSchema() {
-    const sttSchema = this.customConfig.speech.stt;
-
+  async getProviderSchema(req) {
+    const appConfig =
+      req.config ??
+      (await getAppConfig({
+        role: req?.user?.role,
+      }));
+    const sttSchema = appConfig?.speech?.stt;
     if (!sttSchema) {
       throw new Error(
         'No STT schema is set. Did you configure STT in the custom config (librechat.yaml)?',
@@ -170,8 +238,10 @@ class STTService {
       throw new Error('Invalid provider');
     }
 
+    const fileExtension = getFileExtensionFromMime(audioFile.mimetype);
+
     const audioReadStream = Readable.from(audioBuffer);
-    audioReadStream.path = 'audio.wav';
+    audioReadStream.path = `audio.${fileExtension}`;
 
     const [url, data, headers] = strategy.call(this, sttSchema, audioReadStream, audioFile);
 
@@ -200,7 +270,7 @@ class STTService {
    * @param {Object} res - The response object.
    * @returns {Promise<void>}
    */
-  async processTextToSpeech(req, res) {
+  async processSpeechToText(req, res) {
     if (!req.file) {
       return res.status(400).json({ message: 'No audio file provided in the FormData' });
     }
@@ -213,7 +283,7 @@ class STTService {
     };
 
     try {
-      const [provider, sttSchema] = await this.getProviderSchema();
+      const [provider, sttSchema] = await this.getProviderSchema(req);
       const text = await this.sttRequest(provider, sttSchema, { audioBuffer, audioFile });
       res.json({ text });
     } catch (error) {
@@ -223,7 +293,7 @@ class STTService {
       try {
         await fs.unlink(req.file.path);
         logger.debug('[/speech/stt] Temp. audio upload file deleted');
-      } catch (error) {
+      } catch {
         logger.debug('[/speech/stt] Temp. audio upload file already deleted');
       }
     }
@@ -248,7 +318,7 @@ async function createSTTService() {
  */
 async function speechToText(req, res) {
   const sttService = await createSTTService();
-  await sttService.processTextToSpeech(req, res);
+  await sttService.processSpeechToText(req, res);
 }
 
-module.exports = { speechToText };
+module.exports = { STTService, speechToText };

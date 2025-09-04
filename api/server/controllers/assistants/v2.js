@@ -1,9 +1,11 @@
+const { logger } = require('@librechat/data-schemas');
 const { ToolCallTypes } = require('librechat-data-provider');
 const validateAuthor = require('~/server/middleware/assistants/validateAuthor');
 const { validateAndUpdateTool } = require('~/server/services/ActionService');
+const { getCachedTools } = require('~/server/services/Config');
 const { updateAssistantDoc } = require('~/models/Assistant');
+const { manifestToolMap } = require('~/app/clients/tools');
 const { getOpenAIClient } = require('./helpers');
-const { logger } = require('~/config');
 
 /**
  * Create an assistant.
@@ -26,15 +28,26 @@ const createAssistant = async (req, res) => {
     delete assistantData.conversation_starters;
     delete assistantData.append_current_datetime;
 
+    const toolDefinitions = await getCachedTools({ includeGlobal: true });
+
     assistantData.tools = tools
       .map((tool) => {
         if (typeof tool !== 'string') {
           return tool;
         }
 
-        return req.app.locals.availableTools[tool];
+        const toolDef = toolDefinitions[tool];
+        if (!toolDef && manifestToolMap[tool] && manifestToolMap[tool].toolkit === true) {
+          return Object.entries(toolDefinitions)
+            .filter(([key]) => key.startsWith(`${tool}_`))
+
+            .map(([_, val]) => val);
+        }
+
+        return toolDef;
       })
-      .filter((tool) => tool);
+      .filter((tool) => tool)
+      .flat();
 
     let azureModelIdentifier = null;
     if (openai.locals?.azureOptions) {
@@ -81,7 +94,7 @@ const createAssistant = async (req, res) => {
 /**
  * Modifies an assistant.
  * @param {object} params
- * @param {Express.Request} params.req
+ * @param {ServerRequest} params.req
  * @param {OpenAIClient} params.openai
  * @param {string} params.assistant_id
  * @param {AssistantUpdateParams} params.updateData
@@ -112,9 +125,30 @@ const updateAssistant = async ({ req, openai, assistant_id, updateData }) => {
 
   let hasFileSearch = false;
   for (const tool of updateData.tools ?? []) {
-    let actualTool = typeof tool === 'string' ? req.app.locals.availableTools[tool] : tool;
+    const toolDefinitions = await getCachedTools({ includeGlobal: true });
+    let actualTool = typeof tool === 'string' ? toolDefinitions[tool] : tool;
 
-    if (!actualTool) {
+    if (!actualTool && manifestToolMap[tool] && manifestToolMap[tool].toolkit === true) {
+      actualTool = Object.entries(toolDefinitions)
+        .filter(([key]) => key.startsWith(`${tool}_`))
+
+        .map(([_, val]) => val);
+    } else if (!actualTool) {
+      continue;
+    }
+
+    if (Array.isArray(actualTool)) {
+      for (const subTool of actualTool) {
+        if (!subTool.function) {
+          tools.push(subTool);
+          continue;
+        }
+
+        const updatedTool = await validateAndUpdateTool({ req, tool: subTool, assistant_id });
+        if (updatedTool) {
+          tools.push(updatedTool);
+        }
+      }
       continue;
     }
 
@@ -165,7 +199,7 @@ const updateAssistant = async ({ req, openai, assistant_id, updateData }) => {
 /**
  * Modifies an assistant with the resource file id.
  * @param {object} params
- * @param {Express.Request} params.req
+ * @param {ServerRequest} params.req
  * @param {OpenAIClient} params.openai
  * @param {string} params.assistant_id
  * @param {string} params.tool_resource
@@ -193,7 +227,7 @@ const addResourceFileId = async ({ req, openai, assistant_id, tool_resource, fil
 /**
  * Deletes a file ID from an assistant's resource.
  * @param {object} params
- * @param {Express.Request} params.req
+ * @param {ServerRequest} params.req
  * @param {OpenAIClient} params.openai
  * @param {string} params.assistant_id
  * @param {string} [params.tool_resource]

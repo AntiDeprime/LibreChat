@@ -1,12 +1,12 @@
 const express = require('express');
 const { nanoid } = require('nanoid');
-const { actionDelimiter, EModelEndpoint } = require('librechat-data-provider');
+const { logger } = require('@librechat/data-schemas');
+const { actionDelimiter, EModelEndpoint, removeNullishValues } = require('librechat-data-provider');
 const { encryptMetadata, domainParser } = require('~/server/services/ActionService');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
 const { updateAction, getActions, deleteAction } = require('~/models/Action');
 const { updateAssistantDoc, getAssistant } = require('~/models/Assistant');
 const { isActionDomainAllowed } = require('~/server/services/domains');
-const { logger } = require('~/config');
 
 const router = express.Router();
 
@@ -21,6 +21,7 @@ const router = express.Router();
  */
 router.post('/:assistant_id', async (req, res) => {
   try {
+    const appConfig = req.config;
     const { assistant_id } = req.params;
 
     /** @type {{ functions: FunctionTool[], action_id: string, metadata: ActionMetadata }} */
@@ -29,14 +30,17 @@ router.post('/:assistant_id', async (req, res) => {
       return res.status(400).json({ message: 'No functions provided' });
     }
 
-    let metadata = await encryptMetadata(_metadata);
-    const isDomainAllowed = await isActionDomainAllowed(metadata.domain);
+    let metadata = await encryptMetadata(removeNullishValues(_metadata, true));
+    const isDomainAllowed = await isActionDomainAllowed(
+      metadata.domain,
+      appConfig?.actions?.allowedDomains,
+    );
     if (!isDomainAllowed) {
       return res.status(400).json({ message: 'Domain not allowed' });
     }
 
     let { domain } = metadata;
-    domain = await domainParser(req, domain, true);
+    domain = await domainParser(domain, true);
 
     if (!domain) {
       return res.status(400).json({ message: 'No domain provided' });
@@ -63,7 +67,7 @@ router.post('/:assistant_id', async (req, res) => {
       return res.status(404).json({ message: 'Assistant not found' });
     }
 
-    const { actions: _actions = [] } = assistant_data ?? {};
+    const { actions: _actions = [], user: assistant_user } = assistant_data ?? {};
     const actions = [];
     for (const action of _actions) {
       const [_action_domain, current_action_id] = action.split(actionDelimiter);
@@ -99,16 +103,21 @@ router.post('/:assistant_id', async (req, res) => {
 
     let updatedAssistant = await openai.beta.assistants.update(assistant_id, { tools });
     const promises = [];
-    promises.push(
-      updateAssistantDoc(
-        { assistant_id },
-        {
-          actions,
-          user: req.user.id,
-        },
-      ),
-    );
-    promises.push(updateAction({ action_id }, { metadata, assistant_id, user: req.user.id }));
+
+    // Only update user field for new assistant documents
+    const assistantUpdateData = { actions };
+    if (!assistant_data) {
+      assistantUpdateData.user = req.user.id;
+    }
+    promises.push(updateAssistantDoc({ assistant_id }, assistantUpdateData));
+
+    // Only update user field for new actions
+    const actionUpdateData = { metadata, assistant_id };
+    if (!actions_result || !actions_result.length) {
+      // For new actions, use the assistant owner's user ID
+      actionUpdateData.user = assistant_user || req.user.id;
+    }
+    promises.push(updateAction({ action_id }, actionUpdateData));
 
     /** @type {[AssistantDocument, Action]} */
     let [assistantDocument, updatedAction] = await Promise.all(promises);
@@ -120,7 +129,7 @@ router.post('/:assistant_id', async (req, res) => {
     }
 
     /* Map Azure OpenAI model to the assistant as defined by config */
-    if (req.app.locals[EModelEndpoint.azureOpenAI]?.assistants) {
+    if (appConfig.endpoints?.[EModelEndpoint.azureOpenAI]?.assistants) {
       updatedAssistant = {
         ...updatedAssistant,
         model: req.body.model,
@@ -167,7 +176,7 @@ router.delete('/:assistant_id/:action_id/:model', async (req, res) => {
       return true;
     });
 
-    domain = await domainParser(req, domain, true);
+    domain = await domainParser(domain, true);
 
     if (!domain) {
       return res.status(400).json({ message: 'No domain provided' });
@@ -180,15 +189,12 @@ router.delete('/:assistant_id/:action_id/:model', async (req, res) => {
     await openai.beta.assistants.update(assistant_id, { tools: updatedTools });
 
     const promises = [];
-    promises.push(
-      updateAssistantDoc(
-        { assistant_id },
-        {
-          actions: updatedActions,
-          user: req.user.id,
-        },
-      ),
-    );
+    // Only update user field if assistant document doesn't exist
+    const assistantUpdateData = { actions: updatedActions };
+    if (!assistant_data) {
+      assistantUpdateData.user = req.user.id;
+    }
+    promises.push(updateAssistantDoc({ assistant_id }, assistantUpdateData));
     promises.push(deleteAction({ action_id }));
 
     await Promise.all(promises);
