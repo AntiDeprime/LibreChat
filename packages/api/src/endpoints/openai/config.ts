@@ -3,13 +3,13 @@ import { Providers } from '@librechat/agents';
 import { KnownEndpoints, EModelEndpoint, ReasoningParameterFormat } from 'librechat-data-provider';
 import type { Dispatcher } from 'undici';
 import type * as t from '~/types';
+import { getGoogleConfig, stripGeminiFlashBlockedParams } from '~/endpoints/google/llm';
 import { getLLMConfig as getAnthropicLLMConfig } from '~/endpoints/anthropic/llm';
 import { createSSRFSafeAgents, createSSRFSafeUndiciConnect } from '~/auth';
 import { getOpenAILLMConfig, extractDefaultParams } from './llm';
-import { getGoogleConfig } from '~/endpoints/google/llm';
+import { constructAzureResponsesURL } from '~/utils/azure';
 import { transformToOpenAIConfig } from './transform';
 import { getProxyDispatcher } from '~/utils/proxy';
-import { constructAzureURL } from '~/utils/azure';
 import { createFetch } from '~/utils/generators';
 import { mergeHeaders } from '~/utils/headers';
 
@@ -169,9 +169,19 @@ export function getOpenAIConfig(
       },
       true,
     );
-    /** Transform handles addParams/dropParams - it knows about OpenAI params */
+    /**
+     * Transform handles addParams/dropParams - it knows about OpenAI params.
+     * `getGoogleConfig` already stripped Flash-blocked params from `llmConfig`,
+     * but the transform re-applies `addParams` raw, which would undo that; strip
+     * them from the forwarded `addParams` too so the model does not receive
+     * params it rejects. `defaultParams` is applied inside `getGoogleConfig`
+     * (and only read here for tool detection), so it needs no sanitizing.
+     */
     const transformed = transformToOpenAIConfig({
-      addParams,
+      addParams: stripGeminiFlashBlockedParams(
+        addParams,
+        (googleResult.llmConfig as { model?: string }).model,
+      ),
       dropParams,
       defaultParams,
       tools: googleResult.tools,
@@ -260,20 +270,21 @@ export function getOpenAIConfig(
         return;
       }
 
-      const updatedUrl = configOptions.baseURL?.replace(/\/deployments(?:\/.*)?$/, '/v1');
-
-      configOptions.baseURL = constructAzureURL({
-        baseURL: updatedUrl || 'https://${INSTANCE_NAME}.openai.azure.com/openai/v1',
-        azureOptions: azure,
-      });
+      const responsesURL = constructAzureResponsesURL(configOptions.baseURL, azure);
+      const urlQuery = Object.fromEntries(responsesURL.searchParams);
+      responsesURL.search = '';
+      responsesURL.hash = '';
+      configOptions.baseURL = responsesURL.toString();
 
       configOptions.defaultHeaders = {
         ...configOptions.defaultHeaders,
         'api-key': apiKey,
       };
       configOptions.defaultQuery = {
+        ...urlQuery,
         ...configOptions.defaultQuery,
-        'api-version': configOptions.defaultQuery?.['api-version'] ?? 'preview',
+        'api-version':
+          configOptions.defaultQuery?.['api-version'] ?? urlQuery['api-version'] ?? 'preview',
       };
     };
 
